@@ -1,6 +1,7 @@
 from __future__ import print_function, with_statement
 import os
 import json
+import etcd
 from functools import wraps
 from fabric.api import *
 from fabric.colors import red, yellow, white
@@ -8,7 +9,7 @@ from fabric.contrib.console import confirm
 from fabric.contrib.files import exists
 
 
-HOSTS_MESSAGE = """\
+__doc__ = """\
 Before using this fabfile, you must create a .fabhosts in your project
 directory. It is a JSON file with the following structure:
 
@@ -49,18 +50,13 @@ hosts_file = os.path.join(curdir, '.fabhosts')
 
 # Check for the .fabhosts file
 if not os.path.exists(hosts_file):
-    abort(white(HOSTS_MESSAGE))
+    abort(white(__doc__))
 
 base_settings = {
     'host_string': '',
-    'path': '',
-    'repo_url': '',
-    'nginx_conf_dir': '',
-    'supervisor_conf_dir': '',
 }
 
-required_settings = ['host_string', 'path', 'repo_url',
-    'nginx_conf_dir', 'supervisor_conf_dir']
+required_settings = ['host_string']
 
 
 def get_hosts_settings():
@@ -83,152 +79,130 @@ def get_hosts_settings():
     # Validate all hosts have an entry in the .hosts file
     for target in env.hosts:
         if target not in hosts:
-            abort(red('Error: No settings have been defined for the "{0}" host'.format(target)))
+            abort(red('Error: No settings have been defined for the "{}" host'.format(target)))
         settings = hosts[target]
         for key in required_settings:
             if not settings[key]:
-                abort(red('Error: The setting "{0}" is not defined for "{1}" host'.format(key, target)))
+                abort(red('Error: The setting "{}" is not defined for "{}" host'.format(key, target)))
     return hosts
-
-
-hosts = get_hosts_settings()
 
 
 def host_context(func):
     "Sets the context of the setting to the current host"
     @wraps(func)
     def decorator(*args, **kwargs):
+        hosts = get_hosts_settings()
         with settings(**hosts[env.host]):
             return func(*args, **kwargs)
     return decorator
 
+@host_context
+def get_application_config(**kwargs):
+    host = env.host
+    client = etcd.Client(host=env.etcd_host)
+
+    # Retrieve Environment Variables from etcd service
+    env_vars = client.read('/ehb-service/config/%s' % host, recursive=True)
+    env_str = ''
+    for child in env_vars.children:
+        key = child.key.split('/')[-1]
+        if key in kwargs.keys():
+            if kwargs[key]==None:
+                pass
+            else:
+                env_str += '-e %s=%s ' % (key,kwargs[key])
+        else:
+            env_str += '-e %s=%s ' % (key,child.value)
+    env_str += '-e GIT_BRANCH=%s' % (env.git_branch)
+    return env_str
 
 @host_context
-def merge_commit(commit):
-    "Fetches the latest code and merges up the specified commit."
-    with cd(env.path):
-        run('git fetch')
-        if '@' in commit:
-            branch, commit = commit.split('@')
-            run('git checkout {0}'.format(branch))
-        run('git merge {0}'.format(commit))
-        run('find . -type f | grep .pyc | xargs rm -f')
-
-
-@host_context
-def syncdb_migrate():
-    "Syncs and migrates the database using South."
-    verun('./bin/manage.py syncdb --migrate')
-
-
-@host_context
-def symlink_nginx():
-    "Symlinks the nginx config to the host's nginx conf directory."
-    with cd(env.path):
-        run('ln -sf $PWD/server/nginx/{host}.conf '
-            '{nginx_conf_dir}/harvest_project-{host}.conf'.format(**env))
-
-
-@host_context
-def reload_nginx():
-    "Reloads nginx if the config test succeeds."
-    symlink_nginx()
-
-    if run('nginx -t').succeeded:
-        pid = run('supervisorctl pid nginx')
-        run('kill -HUP {0}'.format(pid))
-    elif not confirm(yellow('nginx config test failed. continue?')):
-        abort('nginx config test failed. Aborting')
-
-
-@host_context
-def reload_supervisor():
-    "Re-link supervisor config and force an update to supervisor."
-    with cd(env.path):
-        run('ln -sf $PWD/server/supervisor/{host}.ini '
-            '{supervisor_conf_dir}/harvest_project-{host}.ini'.format(**env))
-    run('supervisorctl update')
-
-
-@host_context
-def reload_wsgi():
-    "Gets the PID for the wsgi process and sends a HUP signal."
-    pid = run('supervisorctl pid harvest_project-{0}'.format(env.host))
-    run('kill -HUP {0}'.format(pid))
-
-
-@host_context
-def deploy(commit, force=False):
-    setup()
-    upload_settings()
-    mm_on()
-    merge_commit(commit)
-    install_deps(force)
-    syncdb_migrate()
-    make()
-    reload_nginx()
-    reload_supervisor()
-    reload_wsgi()
-    mm_off()
-
-
-@host_context
-def make():
-    "Rebuilds all static files using the Makefile."
-    with prefix('rvm use default'):
-        verun('make')
-
-
-@host_context
-def setup():
+def setup_env():
     "Sets up the initial environment."
     parent, project = os.path.split(env.path)
-
     if not exists(parent):
-        run('virtualenv {0}'.format(parent))
+        run('mkdir -p {}'.format(parent))
+        run('virtualenv {}'.format(parent))
 
     with cd(parent):
         if not exists(project):
             run('git clone {repo_url} {project}'.format(project=project, **env))
+            with cd(project):
+                run('git checkout {git_branch}'.format(**env))
+                run('git pull origin {git_branch}'.format(**env))
+        else:
+            with cd(project):
+                run('git checkout {git_branch}'.format(**env))
+                run('git pull origin {git_branch}'.format(**env))
 
 
 @host_context
-def upload_settings():
-    "Uploads the non-versioned local settings to the server."
-    local_path = os.path.join(curdir, 'settings/{0}.py'.format(env.host))
-    if os.path.exists(local_path):
-        remote_path = os.path.join(env.path, 'harvest_project/conf/local_settings.py')
-        put(local_path, remote_path)
-    elif not confirm(yellow('No local settings found for host "{0}". Continue anyway?'.format(env.host))):
-        abort('No local settings found for host "{0}". Aborting.'.format(env.host))
-
-
-@host_context
-def install_deps(force=False):
-    "Install dependencies via pip."
-    if force:
-        verun('pip install -U -r requirements.txt')
-    else:
-        verun('pip install -r requirements.txt')
-
-
-@host_context
-def verun(cmd):
-    "Runs a command after the virtualenv is activated."
+def push_to_repo():
     with cd(env.path):
-        with prefix('source ../bin/activate'):
-            run(cmd)
-
-
-@host_context
-def mm_on():
-    "Turns on maintenance mode."
-    with cd(env.path):
-        run('touch MAINTENANCE_MODE')
-
+        git_hash = run('git rev-parse HEAD')[0:7]
+    run('docker tag ehb-service-%s:%s %s/ehb-service-%s' % (env.git_branch, git_hash, env.docker_registry, env.git_branch))
+    run('docker push %s/ehb-service-%s' % (env.docker_registry, env.git_branch))
+    run('docker rmi %s/ehb-service-%s' % (env.docker_registry, env.git_branch))
 
 @host_context
-def mm_off():
-    "Turns off maintenance mode."
+def test_container():
     with cd(env.path):
-        run('rm -f MAINTENANCE_MODE')
+        git_hash = run('git rev-parse HEAD')[0:7]
+    container = run('docker run -t %s ehb-service-%s:%s  /bin/sh -e /usr/local/bin/test' % (get_application_config(),env.git_branch, git_hash))
+
+@host_context
+def build_container():
+    # Get ID of existing images:
+    # docker images -q ehb-service-development
+    # Get processes running on old container:
+
+    with cd(env.path):
+        setup_env()
+        git_hash = run('git rev-parse HEAD')[0:7]
+    run('docker build -rm -t ehb-service-%s:%s %s' % (env.git_branch, git_hash, env.path))
+
+# @host_context
+# def deploy_container():
+#     # Run the container
+#     container = run('docker run -d -p :8000 %s ehb-service-%s  /bin/sh -e /usr/local/bin/deploy' % (get_application_config(), env.host))
+
+#     # Retrieve information about which port the container is running on.
+#     container_info = json.loads(run('docker inspect %s' % container, quiet=True))[0]
+#     nginx_conf = '''
+#     location /ehb-docker {
+#         uwsgi_param SCRIPT_NAME /ehb-docker;
+#         uwsgi_pass 127.0.0.1:%s;
+#         uwsgi_modifier1 30;
+#         uwsgi_read_timeout 120;
+#         include uwsgi_params;
+#     }
+#     ''' % container_info['NetworkSettings']['Ports']['8000/tcp'][0]['HostPort']
+#     sudo('cat >/etc/nginx/conf.d/ehb-docker-%s.conf <<EOL %s\nEOL' % (env.host,nginx_conf))
+#     reload_nginx()
+
+@host_context
+def pull_repo():
+    with cd(env.path):
+        run('docker pull %s/ehb-service-%s' % (env.docker_registry, env.git_branch))
+
+@host_context
+def run_container():
+    # with cd(env.path):
+        #setup_env()
+    pull_repo()
+    container = run('docker run -d -p :8000 %s %s/ehb-service-%s:latest  /bin/sh -e /usr/local/bin/run' % (get_application_config(FORCE_SCRIPT_NAME=''),env.docker_registry, env.git_branch))
+    container_info = json.loads(run('docker inspect %s' % container, quiet=True))[0]
+    print(red('Now running at http://%s:%s ' % (env.host_string,container_info['NetworkSettings']['Ports']['8000/tcp'][0]['HostPort'])))
+
+@host_context
+def reload_nginx():
+    sudo('/etc/init.d/nginx reload')
+
+@host_context
+def integration_test():
+    # Production copy down
+    pass
+    # Test on production data
+    container = run('')
+    # Run on
+    pass
