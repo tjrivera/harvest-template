@@ -1,21 +1,26 @@
 Django>=1.5.5,<1.6
+Markdown
+uWSGI
+Fabric=1.4.4
 
 # Database Drivers, the Python stdlib has support for SQLite
-# psycopg2
+psycopg2
 # cx_oracle
 # mysql-python
 
-# WSGI server
-# uWSGI
-
-# Deployment with fabfile.py
-# Fabric
 
 # Harvest components
 avocado>=2.3.0,<2.4.0
-serrano>=2.3.0,<2.4.0
+serrano>=2.3.0,<2.3.3
+django-haystack>=2.0,<2.2
+python-memcached=1.53
+dj_database_url
+
+# eHB Integration
+git+http://github.research.chop.edu/cbmi/ehb-client.git#egg=ehb-client
+git+http://github.research.chop.edu/cbmi/ehb-datasources.git#egg=ehb-datasources
 
 # Harvest extensions
-django-haystack==2.0.0
-Whoosh==2.4.0
+Whoosh>=2.6,<2.7
+pycap
 openpyxl
